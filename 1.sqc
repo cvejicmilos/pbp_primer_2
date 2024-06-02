@@ -1,0 +1,249 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sql.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+// Prvi deo zadatka
+char hStmt[1024];
+short hSkGodina;
+char hPrezime[51];
+char hIme[51];
+sqlint32 hIndeks;
+
+// Drugi deo zadatka
+char hNaslovRada[151];
+sqlint32 hIdPredmeta;
+char hNazivPredmeta[151];
+EXEC SQL END DECLARE SECTION;
+
+void checkSQL(const char *msg) {
+    if(SQLCODE < 0) {
+        char Buffer[1024];
+        short BufferSize = sizeof(Buffer);
+        short LineWidth = 50;
+        sqlaintp(Buffer, BufferSize, LineWidth, &sqlca);
+
+        printf("SQL greska %d: %s\n", sqlca.sqlcode, msg);
+        printf("%s\n", Buffer);
+
+        EXEC SQL ROLLBACK;
+        
+        EXEC SQL SET CURRENT LOCK TIMEOUT NULL;
+
+        EXEC SQL CONNECT RESET;
+        exit(EXIT_FAILURE);
+    }
+}
+
+int checkLock1(const char *msg);
+int checkLock2(const char *msg);
+
+int main() {
+    EXEC SQL CONNECT TO stud2020 USER student USING abcdef;
+    checkSQL("CONNECT TO");
+    
+    EXEC SQL SET CURRENT LOCK TIMEOUT 5;
+    checkSQL("LOCK 5");
+    
+    // Prvi deo zadatka - priprema
+    sprintf(hStmt, 
+        "SELECT      PREZIME, "
+        "            IME, "
+        "            D.INDEKS "
+        "FROM        DA.DOSIJE D JOIN "
+        "            DA.UPISGODINE U ON D.INDEKS = U.INDEKS "
+        "WHERE       U.SKGODINA = ? AND "
+        "            NOT EXISTS ( "
+        "                SELECT  * "
+        "                FROM    DA.UPISGODINE U2 "
+        "                WHERE   D.INDEKS = U2.INDEKS AND "
+        "                        U2.SKGODINA < U.SKGODINA "
+        "            ) "
+        "ORDER BY    PREZIME ASC "
+        "WITH        RR"
+    );
+    
+    EXEC SQL 
+        PREPARE pStmt FROM :hStmt;
+    checkSQL("PREPARE");
+    
+    EXEC SQL 
+        DECLARE cStudenti CURSOR WITH HOLD FOR pStmt;
+    checkSQL("DECLARE cStudenti");
+    
+    // Drugi deo zadatka - priprema
+    EXEC SQL 
+        DECLARE cPredmeti CURSOR WITH HOLD FOR
+        WITH POLOZENI_PREDMETI AS (
+            SELECT		INDEKS,
+                        SKGODINA,
+                        IDPREDMETA
+            FROM		DA.ISPIT I 
+            WHERE		OCENA > 5 AND
+                        STATUS = 'o'
+        )
+
+        SELECT	IDPREDMETA,
+                NAZIV
+        FROM	DA.UPISANKURS UK JOIN 
+                DA.PREDMET P ON UK.IDPREDMETA = P.ID
+        WHERE	INDEKS = :hIndeks AND 
+                SKGODINA = :hSkGodina AND 
+                NOT EXISTS (
+                    SELECT 	*
+                    FROM	POLOZENI_PREDMETI
+                    WHERE	INDEKS = UK.INDEKS AND 
+                            SKGODINA = UK.SKGODINA AND
+                            IDPREDMETA = UK.IDPREDMETA
+                ) AND 
+                NOT EXISTS (
+                    SELECT 	*
+                    FROM	DA.SEMINARSKI_RADOVI
+                    WHERE	INDEKS = UK.INDEKS AND 
+                            SKGODINA = UK.SKGODINA AND
+                            IDPREDMETA = UK.IDPREDMETA
+                )
+        WITH    RR;
+    checkSQL("DECLARE cPredmeti");
+    
+    char odgovor;
+    do {
+        // Prvi deo zadatka
+        printf("Unesite skolsku godinu: ");
+        scanf("%hd", &hSkGodina);
+    
+        EXEC SQL 
+            OPEN cStudenti USING :hSkGodina;
+        checkSQL("OPEN cStudenti");
+        
+        unsigned brojRedova = 0;
+        for (;;) {
+            EXEC SQL 
+                FETCH   cStudenti
+                INTO    :hPrezime,
+                        :hIme,
+                        :hIndeks;
+            if (checkLock1("FETCH cStudenti")) {
+                continue;
+            }
+            checkSQL("FETCH cStudenti");
+            
+            if (SQLCODE == 100) {
+                break;
+            }
+            
+            printf("%-30s %-30s %d\n", hPrezime, hIme, hIndeks);
+            ++brojRedova;
+            
+            if (brojRedova == 10u) {
+                printf("\nUnesite indeks studenta ili 0 za nastavak ispisa rezultata: ");
+                scanf("%d", &hIndeks);
+                
+                if (hIndeks != 0) {
+                    break;
+                }
+                
+                brojRedova = 0;
+            }
+        }
+        
+        getchar(); // novi red
+        
+        EXEC SQL 
+            CLOSE cStudenti;
+        checkSQL("CLOSE cStudenti");
+        
+        // Drugi deo zadatka        
+        EXEC SQL 
+            OPEN cPredmeti;
+        checkSQL("OPEN cPredmeti");
+        
+        for (;;) {
+            EXEC SQL 
+                FETCH   cPredmeti
+                INTO    :hIdPredmeta,
+                        :hNazivPredmeta;
+            if (checkLock2("FETCH cPredmeti")) {
+                continue;
+            }
+            checkSQL("FETCH cPredmeti");
+            
+            if (SQLCODE == 100) {
+                break;
+            }
+            
+            printf("\nDa li zelite da prijavite seminarski rad za predmet\n\t%s (%hd)? [d/n] ", hNazivPredmeta, hIdPredmeta);
+            odgovor = getchar(); 
+            getchar(); // novi red
+            
+            if (odgovor == 'd') {
+                printf("Unesite naziv seminarskog rada: ");
+                fgets(hNaslovRada, sizeof(hNaslovRada), stdin);
+                hNaslovRada[strcspn(hNaslovRada, "\n")] = '\0';
+                
+                EXEC SQL 
+                    INSERT  INTO DA.SEMINARSKI_RADOVI
+                    VALUES  (:hIndeks, :hSkGodina, :hIdPredmeta, :hNaslovRada, NULL, NULL);
+                if (checkLock2("INSERT")) {
+                    continue;
+                }
+                checkSQL("INSERT");
+            }
+        }
+        
+        EXEC SQL 
+            CLOSE cPredmeti;
+        checkSQL("CLOSE");
+        
+        EXEC SQL COMMIT;
+        checkSQL("Kraj transakcije");
+        
+        printf("\nDa li zelite da zavrsite obradu? [d/n] ");
+        odgovor = getchar();
+        getchar(); // novi red
+    } while (odgovor == 'd');
+    
+    EXEC SQL SET CURRENT LOCK TIMEOUT NULL;
+    checkSQL("LOCK NULL");
+
+    EXEC SQL COMMIT;
+    checkSQL("COMMIT");
+    
+    EXEC SQL CONNECT RESET;
+    checkSQL("CONNECT RESET");
+    
+    return 0;
+}
+
+int checkLock1(const char *msg) {
+    if (-913 <= SQLCODE && SQLCODE <= -911) {
+        printf("[%s] Objekat je zakljucan od strane druge transakcije. Molimo sacekajte!\n", msg);
+        
+        EXEC SQL ROLLBACK;
+        checkSQL("ROLLBACK in checkLock1");
+        
+        EXEC SQL OPEN cStudenti;
+        checkSQL("OPEN in checkLock1");
+        
+        return 1;
+    }
+    return 0;
+}
+
+int checkLock2(const char *msg) {
+    if (-913 <= SQLCODE && SQLCODE <= -911) {
+        printf("[%s] Objekat je zakljucan od strane druge transakcije. Molimo sacekajte!\n", msg);
+        
+        EXEC SQL ROLLBACK;
+        checkSQL("ROLLBACK in checkLock2");
+        
+        EXEC SQL OPEN cPredmeti;
+        checkSQL("OPEN in checkLock2");
+        
+        return 1;
+    }
+    return 0;
+}
